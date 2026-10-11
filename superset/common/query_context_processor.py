@@ -43,10 +43,17 @@ from superset.common.utils.time_range_utils import get_since_until_from_time_ran
 from superset.constants import CACHE_DISABLED_TIMEOUT, CacheRegion
 from superset.daos.annotation_layer import AnnotationLayerDAO
 from superset.daos.chart import ChartDAO
+from superset.daos.datasource import DatasourceDAO
+from superset.daos.exceptions import (
+    DatasourceNotFound,
+    DatasourceTypeNotSupportedError,
+    DatasourceValueIsIncorrect,
+)
 from superset.dataframe import df_to_records
 from superset.exceptions import (
     CacheLoadError,
     QueryObjectValidationError,
+    SemanticResultCompletenessError,
     SupersetException,
     SupersetSecurityException,
     SupersetTemplateException,
@@ -54,8 +61,9 @@ from superset.exceptions import (
 from superset.explorables.base import Explorable
 from superset.extensions import cache_manager, security_manager
 from superset.models.helpers import QueryResult
+from superset.semantic_layers.models import SemanticView
 from superset.superset_typing import AdhocColumn, AdhocMetric, Column
-from superset.utils import csv, excel
+from superset.utils import csv, excel, json
 from superset.utils.cache import generate_cache_key, set_and_log_cache
 from superset.utils.core import (
     ANNOTATION_SOURCE_TYPES_WITH_CHART_REFERENCE,
@@ -74,6 +82,7 @@ from superset.utils.pandas_postprocessing.utils import unescape_separator
 if TYPE_CHECKING:
     from superset.common.query_context import QueryContext
     from superset.common.query_object import QueryObject
+    from superset.daos.datasource import Datasource
     from superset.db_engine_specs.base import BaseEngineSpec
 
 logger = logging.getLogger(__name__)
@@ -322,6 +331,8 @@ class QueryContextProcessor:
                     )
 
                 query_result = self.get_query_result(query_obj)
+            except SemanticResultCompletenessError:
+                raise
             except QueryObjectValidationError as ex:
                 cache.error_message = str(ex)
                 cache.status = QueryStatus.FAILED
@@ -364,6 +375,8 @@ class QueryContextProcessor:
                     timeout=self.get_cache_timeout(),
                     datasource_uid=self._qc_datasource.uid,
                 )
+            except SemanticResultCompletenessError:
+                raise
             except QueryObjectValidationError as ex:
                 cache.error_message = str(ex)
                 cache.status = QueryStatus.FAILED
@@ -469,14 +482,16 @@ class QueryContextProcessor:
         share one cache entry. See :meth:`annotation_cache_key` for the
         separate, user-scoped key covering annotation-layer data.
         """
-        datasource = self._qc_datasource
+        datasource: Explorable = self._qc_datasource
+        # Reject unenforceable restrictions before provider identity or cache reads.
+        rls: list[str] = security_manager.get_rls_cache_key(datasource)
         extra_cache_keys = datasource.get_extra_cache_keys(query_obj.to_dict())
 
         cache_key = (
             query_obj.cache_key(
                 datasource=datasource.uid,
                 extra_cache_keys=extra_cache_keys,
-                rls=security_manager.get_rls_cache_key(datasource),
+                rls=rls,
                 changed_on=datasource.changed_on,
                 **kwargs,
             )
@@ -603,6 +618,7 @@ class QueryContextProcessor:
                     annotation_query_context.query_cache_key(query_object)
                     for query_object in annotation_query_context.queries
                 ]
+                annotation_datasource: Any = annotation_query_context.datasource
             else:
                 # Fall back to the RLS-clause identity when the chart has no
                 # saved query context to key on. resolved_datasource, not
@@ -614,6 +630,17 @@ class QueryContextProcessor:
                     return None
                 access = security_manager.can_access_datasource(datasource)
                 data_key = security_manager.get_rls_cache_key(datasource)
+                annotation_datasource = datasource
+            scope: dict[str, Any] = {"access": access, "data_key": data_key}
+            # Semantic-view results are versioned by the layer's metadata
+            # generation and result discriminator, which the datasource-level
+            # key material above does not carry.
+            if isinstance(annotation_datasource, SemanticView):
+                scope["metadata_version"] = annotation_datasource.metadata_generation
+                if (
+                    discriminator := annotation_datasource.result_cache_discriminator
+                ) is not None:
+                    scope["result_version"] = discriminator
         except Exception:  # noqa: BLE001  pylint: disable=broad-except
             # Derivation can fail well beyond SupersetException: the DAO
             # lookup and lazy ``datasource`` load are themselves live DB
@@ -631,7 +658,7 @@ class QueryContextProcessor:
                 exc_info=True,
             )
             return None
-        return {"access": access, "data_key": data_key}
+        return scope
 
     def _get_annotation_data_cached(
         self,
@@ -1184,6 +1211,8 @@ class QueryContextProcessor:
             command.validate()
             payload = command.run()
             return {"records": payload["queries"][0]["data"]}
+        except SemanticResultCompletenessError:
+            raise
         except SupersetException as ex:
             raise QueryObjectValidationError(error_msg_from_exception(ex)) from ex
 
